@@ -63,8 +63,7 @@ jobs:
           echo "顶层包       : $BUILD_TARGETS"
 
       # ------------------------------------------------------------------
-      # output/ 也要缓存：否则重跑时所有包都因“已构建”被跳过，
-      # output/ 空着 -> 又变成“没有任何 .deb 产出”
+      # output/ 也要缓存，否则重跑时所有包都因“已构建”被跳过，output/ 空着
       # ------------------------------------------------------------------
       - name: Restore build state
         uses: actions/cache@v4
@@ -77,6 +76,21 @@ jobs:
           key: fork-build-${{ env.BUILD_ARCH }}-${{ github.sha }}
           restore-keys: |
             fork-build-${{ env.BUILD_ARCH }}-
+
+      # ------------------------------------------------------------------
+      # 自愈：缓存里有“已构建”标记但 output/ 没 deb（上一轮上传失败/旧缓存没存
+      # output），所有包都会被跳过、一个包也打不出来 —— 此时清标记强制重打。
+      # ------------------------------------------------------------------
+      - name: Heal stale build markers
+        run: |
+          mkdir -p .ci/built output
+          markers=$(find .ci/built -maxdepth 1 -type f 2>/dev/null | wc -l)
+          debs=$(find output -maxdepth 1 -name '*.deb' 2>/dev/null | wc -l)
+          echo "已构建标记: $markers   现有 deb: $debs"
+          if [ "$markers" -gt 0 ] && [ "$debs" -eq 0 ]; then
+            echo "::warning::有构建标记但没有 deb，清除标记强制重新打包（约 1 小时）"
+            rm -rf .ci/built/*
+          fi
 
       # ------------------------------------------------------------------
       - name: Apply custom package name
@@ -225,20 +239,20 @@ jobs:
           for f in "${debs[@]}"; do
             listing="$(dpkg-deb -c "$f" 2>/dev/null)" || listing=""
             if [ -z "$listing" ]; then
-              empty=$((empty + 1)); echo "  [空/元包] $(basename "$f")"
+              empty=$((empty + 1))
             elif grep -qF "${GOOD}/" <<<"$listing"; then
               ok=$((ok + 1))
             elif grep -qF "${OLD}/" <<<"$listing"; then
               wrong=$((wrong + 1)); echo "::error::$(basename "$f") 用的是旧 prefix ${OLD}"
             else
-              empty=$((empty + 1)); echo "  [无 prefix 文件] $(basename "$f")"
+              empty=$((empty + 1))
             fi
           done
 
           echo ""
           echo "路径正确 : $ok / ${#debs[@]}"
-          echo "无文件   : $empty（元包/纯脚本包，正常）"
-          echo "旧 prefix: $wrong"
+          echo "无 prefix 文件（元包/纯脚本包，正常）: $empty"
+          echo "误用旧 prefix: $wrong"
           echo "目标 prefix: ${GOOD}"
 
           {
@@ -246,7 +260,7 @@ jobs:
             echo ""
             echo "- 总包数：**${#debs[@]}**"
             echo "- 路径正确：**${ok}**"
-            echo "- 无文件（元包）：${empty}"
+            echo "- 无 prefix 文件（元包）：${empty}"
             echo "- 误用旧 prefix：**${wrong}**"
             echo "- 目标 prefix：\`${GOOD}\`"
             echo ""
