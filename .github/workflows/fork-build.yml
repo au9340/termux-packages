@@ -1,12 +1,11 @@
 name: Fork build
 
-# 这是官方 .github/workflows/packages.yml 的 build job 的最小照抄版。
-# 相对官方只多了两处，其余（runner、docker 调用方式、产物打包方式、artifact 命名）
-# 全部保持一致：
+# 官方 .github/workflows/packages.yml 的 build job 的最小照抄版。
+# 相对官方只有三处差异，其余（runner、docker 调用、产物打包、artifact 命名）完全一致：
 #   1. 构建前把 TERMUX_APP__PACKAGE_NAME 换成 bin.mt.plus
 #   2. 容器里 /data/data 是 root:root，需先用 root 建出自定义 prefix 目录
-# 官方自带的 buildorder 分批 / 构建缓存 / 前缀校验都不需要：
-# build-package.sh 一条命令就会自己递归构建全部依赖。
+#   3. 顶层包逐个调用（官方一次只传本次改动的几个包，我们一次传 33 个，
+#      若一次全传，单个失败会让后面的全部不编）
 #
 # 触发：push 到 master 且 commit message 带 [build]，或手动 Run workflow。
 
@@ -17,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       packages:
-        description: "空格分隔的包名（依赖会被 build-package.sh 自动递归构建）"
+        description: "空格分隔的包名（依赖由 build-package.sh 自动递归构建）"
         required: true
         default: "apt bash bzip2 command-not-found coreutils curl dash diffutils findutils gawk grep gzip less procps psmisc sed tar termux-core termux-exec termux-keyring termux-tools util-linux xz-utils ed debianutils dos2unix inetutils lsof nano net-tools patch unzip"
       arch:
@@ -79,12 +78,32 @@ jobs:
 
     - name: Build packages
       run: |
-        ./scripts/run-docker.sh -d ./build-package.sh \
-          -I -C -a '${{ inputs.arch || 'aarch64' }}' \
-          ${{ inputs.packages || 'apt bash bzip2 command-not-found coreutils curl dash diffutils findutils gawk grep gzip less procps psmisc sed tar termux-core termux-exec termux-keyring termux-tools util-linux xz-utils ed debianutils dos2unix inetutils lsof nano net-tools patch unzip' }}
+        ARCH='${{ inputs.arch || 'aarch64' }}'
+        PKGS='${{ inputs.packages || 'apt bash bzip2 command-not-found coreutils curl dash diffutils findutils gawk grep gzip less procps psmisc sed tar termux-core termux-exec termux-keyring termux-tools util-linux xz-utils ed debianutils dos2unix inetutils lsof nano net-tools patch unzip' }}'
+        failed=""
+        for pkg in $PKGS; do
+          echo "::group::build $pkg"
+          if ./scripts/run-docker.sh -d ./build-package.sh -I -C -a "$ARCH" "$pkg"; then
+            echo "OK: $pkg"
+          else
+            echo "::error title=构建失败::$pkg"
+            failed="$failed $pkg"
+          fi
+          echo "::endgroup::"
+        done
+        echo "=============================================="
+        echo "失败的顶层包:${failed:- 无}"
+        echo "已产出 deb: $(ls output/*.deb 2>/dev/null | wc -l) 个"
+        echo "=============================================="
+        {
+          echo "### 构建结果"
+          echo ""
+          echo "- 失败:${failed:- 无}"
+          echo "- 产出 deb: $(ls output/*.deb 2>/dev/null | wc -l) 个"
+        } >> "$GITHUB_STEP_SUMMARY"
+        [ -z "$failed" ]
 
-    # 与官方一致：deb 文件名里可能含 ':'（epoch），不能直接上传，
-    # 必须先打成 tar 再作为 artifact 上传
+    # 与官方一致：deb 文件名里可能含 ':'（epoch），不能直接上传，须先打 tar
     - name: Generate build artifacts
       if: always()
       run: |
@@ -95,8 +114,12 @@ jobs:
         echo "共产出 ${#debs[@]} 个 .deb"
         if [ ${#debs[@]} -gt 0 ]; then
           cp "${debs[@]}" debs/
+          echo "--- 前 5 个 ---"
+          ls -1 debs/*.deb | head -5
+          echo "--- 路径抽查 ---"
           dpkg-deb -c "${debs[0]}" | head -3
-          dpkg-deb -f "${debs[0]}" Package Version Architecture
+        else
+          echo "::error::output/ 里没有 .deb"
         fi
         tar cf "artifacts/debs-${ARCH}-${GITHUB_SHA}.tar" debs
         ls -lh artifacts/
