@@ -1,0 +1,137 @@
+name: Fork build
+
+# 手动触发：Actions -> Fork build -> Run workflow
+# 不需要修改 scripts/properties.sh，workflow 自己 sed。
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "要编译的包，空格分隔，例如: libandroid-support zlib apt"
+        required: true
+      arch:
+        description: "目标架构"
+        required: true
+        default: aarch64
+        type: choice
+        options:
+          - aarch64
+          - arm
+          - i686
+          - x86_64
+          - all
+      free-space:
+        description: "构建前先清理 runner 磁盘空间（包多时建议开）"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-build-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  # ==== 这里就是你的 fork 配置 ====
+  # 只改这一项即可：Android app 包名
+  FORK_APP_PACKAGE_NAME: bin.mt.plus
+  # 如果 MT 实际用的是 files/term 布局，把下面两项改成 term / term/home，
+  # 并把 USR_MERGE_VALIDATION 设为 false
+  FORK_PREFIX_SUBDIR: usr
+  FORK_HOME_SUBDIR: home
+  USR_MERGE_VALIDATION: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Apply custom package name
+        run: |
+          set -euo pipefail
+          sed -i -E \
+            "s@^TERMUX_APP__PACKAGE_NAME=\"com\\.termux\"\$@TERMUX_APP__PACKAGE_NAME=\"${FORK_APP_PACKAGE_NAME}\"@" \
+            scripts/properties.sh
+          sed -i -E \
+            "s@^TERMUX__PREFIX_SUBDIR=\"usr\"\$@TERMUX__PREFIX_SUBDIR=\"${FORK_PREFIX_SUBDIR}\"@" \
+            scripts/properties.sh
+          sed -i -E \
+            "s@^TERMUX__HOME_SUBDIR=\"home\"\$@TERMUX__HOME_SUBDIR=\"${FORK_HOME_SUBDIR}\"@" \
+            scripts/properties.sh
+          sed -i -E \
+            "s@^__TERMUX_BUILD_PROPS__VALIDATE_TERMUX_PREFIX_USR_MERGE_FORMAT=\"true\"\$@__TERMUX_BUILD_PROPS__VALIDATE_TERMUX_PREFIX_USR_MERGE_FORMAT=\"${USR_MERGE_VALIDATION}\"@" \
+            scripts/properties.sh
+
+          if ! git diff --quiet; then
+            git diff
+          else
+            echo "::error ::properties.sh was not modified, sed patterns did not match"
+            exit 1
+          fi
+
+      - name: Show effective paths
+        run: |
+          bash -c '. scripts/properties.sh
+            printf "APP_DATA_DIR = %s\nPREFIX       = %s\nHOME         = %s\nROOTFS       = %s\n" \
+              "$TERMUX_APP__DATA_DIR" "$TERMUX__PREFIX" "$TERMUX__HOME" "$TERMUX__ROOTFS"'
+
+      - name: Create builder container
+        run: ./scripts/run-docker.sh true
+
+      - name: Prepare custom prefix inside container
+        run: |
+          set -euo pipefail
+          DATA_DIR="/data/data/${FORK_APP_PACKAGE_NAME}"
+          PREFIX="${DATA_DIR}/files/${FORK_PREFIX_SUBDIR}"
+          HOME_DIR="${DATA_DIR}/files/${FORK_HOME_SUBDIR}"
+
+          # /data/data 在镜像里是 root:root 0755，builder 无法直接 mkdir
+          docker exec -u root termux-package-builder mkdir -p "$PREFIX" "$HOME_DIR" "${PREFIX}/tmp"
+          docker exec -u root termux-package-builder chown -R builder:builder "$DATA_DIR"
+
+          docker exec termux-package-builder sh -c "test -w '$PREFIX' && echo 'prefix writable OK'"
+
+      - name: Free additional disk space
+        if: ${{ inputs.free-space }}
+        run: ./scripts/free-space.sh
+
+      - name: Build packages
+        run: |
+          ./scripts/run-docker.sh ./build-package.sh \
+            -a "${{ inputs.arch }}" -C ${{ inputs.packages }}
+
+      - name: Verify artifact paths
+        if: always()
+        run: |
+          set -o pipefail
+          shopt -s nullglob
+          debs=(output/*.deb)
+          echo "built ${#debs[@]} .deb files"
+          for f in "${debs[@]}"; do
+            dpkg-deb -f "$f" Package Version Architecture 2>/dev/null | tr '\n' ' '
+            echo
+          done
+          expected="/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}"
+          if [ ${#debs[@]} -gt 0 ]; then
+            dpkg-deb -c "${debs[0]}" | head -3
+            if dpkg-deb -c "${debs[0]}" | grep -q "\.${expected}/"; then
+              echo "OK: paths point to ${expected}"
+            else
+              echo "::error ::deb paths do not contain ${expected}"
+              exit 1
+            fi
+          fi
+
+      - name: Upload debs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ inputs.arch }}-${{ github.sha }}
+          path: output/*.deb
+          if-no-files-found: warn
+          retention-days: 30
