@@ -62,9 +62,6 @@ jobs:
           echo "分批大小     : $BUILD_CHUNK_SIZE"
           echo "顶层包       : $BUILD_TARGETS"
 
-      # ------------------------------------------------------------------
-      # output/ 也要缓存，否则重跑时所有包都因“已构建”被跳过，output/ 空着
-      # ------------------------------------------------------------------
       - name: Restore build state
         uses: actions/cache@v4
         with:
@@ -78,8 +75,9 @@ jobs:
             fork-build-${{ env.BUILD_ARCH }}-
 
       # ------------------------------------------------------------------
-      # 自愈：缓存里有“已构建”标记但 output/ 没 deb（上一轮上传失败/旧缓存没存
-      # output），所有包都会被跳过、一个包也打不出来 —— 此时清标记强制重打。
+      # 自愈：正常的完整构建里 deb 数 >= 标记数（子包会产生额外 deb）。
+      # 若 deb 数 < 标记数，说明上一轮的 deb 丢了（上传失败/旧缓存没存 output），
+      # 此时所有包都会被“已构建”跳过，一个包也打不出来 —— 清标记强制重打。
       # ------------------------------------------------------------------
       - name: Heal stale build markers
         run: |
@@ -87,12 +85,12 @@ jobs:
           markers=$(find .ci/built -maxdepth 1 -type f 2>/dev/null | wc -l)
           debs=$(find output -maxdepth 1 -name '*.deb' 2>/dev/null | wc -l)
           echo "已构建标记: $markers   现有 deb: $debs"
-          if [ "$markers" -gt 0 ] && [ "$debs" -eq 0 ]; then
-            echo "::warning::有构建标记但没有 deb，清除标记强制重新打包（约 1 小时）"
+          if [ "$markers" -gt 0 ] && [ "$debs" -lt "$markers" ]; then
+            echo "::warning::deb 数($debs) 少于构建标记($markers)，产物不完整，清除标记强制重新打包"
             rm -rf .ci/built/*
+            rm -f output/*.deb
           fi
 
-      # ------------------------------------------------------------------
       - name: Apply custom package name
         run: |
           set -euo pipefail
@@ -141,7 +139,6 @@ jobs:
           cat /tmp/order.txt
           test -s /tmp/order.txt
 
-      # ------------------------------------------------------------------
       - name: Prepare persistent dirs and container
         run: |
           set -euo pipefail
@@ -158,8 +155,6 @@ jobs:
             PATH=/usr/local/bin:/usr/bin:/bin ./scripts/run-docker.sh true
           fi
 
-          docker exec termux-package-builder sh -c 'mount | grep -E "termux-packages|/data/data|termux-build" || true'
-
           PREFIX_DIR="/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}"
           docker exec -u root termux-package-builder mkdir -p \
               "${PREFIX_DIR}" \
@@ -173,9 +168,6 @@ jobs:
         continue-on-error: true
         run: ./scripts/free-space.sh
 
-      # ------------------------------------------------------------------
-      # 冒烟测试：环境不对这里 2 分钟就炸，不用等一小时
-      # ------------------------------------------------------------------
       - name: Smoke test (zlib)
         timeout-minutes: 45
         run: |
@@ -183,7 +175,6 @@ jobs:
           ls -l output/zlib_*.deb
           dpkg-deb -c output/zlib_*.deb | head -3
 
-      # ------------------------------------------------------------------
       - name: Build packages
         timeout-minutes: 300
         continue-on-error: true
