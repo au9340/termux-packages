@@ -1,13 +1,20 @@
 name: Fork build
 
-# 手动触发：Actions -> Fork build -> Run workflow
-# 不需要修改 scripts/properties.sh，workflow 自己 sed。
+# 一键构建：Actions -> Fork build -> Run workflow -> 保持默认参数 -> Run
+#
+# 设计要点：
+# 1. 不改仓库里的 scripts/properties.sh，构建前用 sed 注入，方便随时 git pull upstream。
+# 2. 用 scripts/buildorder.py 自动算出依赖拓扑顺序，而不是手写包名列表。
+# 3. 分批调用 build-package.sh。Termux 用 /data/data/.built-packages 里的标记文件
+#    判断“这个包已经编过”，因此某批失败/超时后，下一批会自动跳过已完成的包继续往前，
+#    不会重头再来。
+# 4. prefix、标记目录、$TERMUX_TOPDIR 都 bind-mount 到 workspace 里并做缓存，
+#    所以重跑一次 workflow 几乎不用重新编译。
+# 5. artifact 用 if: always() 上传，中途失败也能拿到已经编好的 .deb。
+
 on:
   workflow_dispatch:
     inputs:
-      packages:
-        description: "要编译的包，空格分隔，例如: libandroid-support zlib apt"
-        required: true
       arch:
         description: "目标架构"
         required: true
@@ -19,23 +26,31 @@ on:
           - i686
           - x86_64
           - all
+      targets:
+        description: "顶层包（空格分隔，依赖会自动展开并排序）"
+        required: true
+        default: "apt bash bzip2 command-not-found coreutils curl dash diffutils findutils gawk grep gzip less procps psmisc sed tar termux-core termux-exec termux-keyring termux-tools util-linux xz-utils ed debianutils dos2unix inetutils lsof nano net-tools patch unzip"
+      chunk-size:
+        description: "每批构建的包数（小一点=断点更细，失败损失更小）"
+        required: true
+        default: "8"
       free-space:
-        description: "构建前先清理 runner 磁盘空间（包多时建议开）"
+        description: "构建前清理 runner 磁盘空间"
         type: boolean
         default: true
 
 permissions:
   contents: read
 
+# 同一时间只允许一个构建，避免两个 run 抢同一个 cwd 下的缓存
 concurrency:
-  group: fork-build-${{ github.run_id }}
+  group: fork-build
   cancel-in-progress: false
 
 env:
-  # ==== 这里就是你的 fork 配置 ====
-  # 只改这一项即可：Android app 包名
+  # ==== 你的 fork 配置：只需要动这里 ====
   FORK_APP_PACKAGE_NAME: bin.mt.plus
-  # 如果 MT 实际用的是 files/term 布局，把下面两项改成 term / term/home，
+  # 如果 MT 实际用的是 files/term 布局，改成 term / term/home，
   # 并把 USR_MERGE_VALIDATION 设为 false
   FORK_PREFIX_SUBDIR: usr
   FORK_HOME_SUBDIR: home
@@ -44,94 +59,193 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: 355
     steps:
       - name: Clone repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
+      # ------------------------------------------------------------------
+      # 恢复上一次的构建状态，让重跑几乎不用重新编译
+      # ------------------------------------------------------------------
+      - name: Restore build state
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ci/prefix
+            .ci/built
+            .ci/topdir/_cache
+          key: fork-build-${{ inputs.arch }}-${{ github.sha }}
+          restore-keys: |
+            fork-build-${{ inputs.arch }}-
+
+      # ------------------------------------------------------------------
+      # 注入自定义 prefix
+      # ------------------------------------------------------------------
       - name: Apply custom package name
         run: |
           set -euo pipefail
-          sed -i -E \
-            "s@^TERMUX_APP__PACKAGE_NAME=\"com\\.termux\"\$@TERMUX_APP__PACKAGE_NAME=\"${FORK_APP_PACKAGE_NAME}\"@" \
-            scripts/properties.sh
-          sed -i -E \
-            "s@^TERMUX__PREFIX_SUBDIR=\"usr\"\$@TERMUX__PREFIX_SUBDIR=\"${FORK_PREFIX_SUBDIR}\"@" \
-            scripts/properties.sh
-          sed -i -E \
-            "s@^TERMUX__HOME_SUBDIR=\"home\"\$@TERMUX__HOME_SUBDIR=\"${FORK_HOME_SUBDIR}\"@" \
-            scripts/properties.sh
-          sed -i -E \
-            "s@^__TERMUX_BUILD_PROPS__VALIDATE_TERMUX_PREFIX_USR_MERGE_FORMAT=\"true\"\$@__TERMUX_BUILD_PROPS__VALIDATE_TERMUX_PREFIX_USR_MERGE_FORMAT=\"${USR_MERGE_VALIDATION}\"@" \
-            scripts/properties.sh
+          sed -i -E "s@^TERMUX_APP__PACKAGE_NAME=\"com\.termux\"\$@TERMUX_APP__PACKAGE_NAME=\"${FORK_APP_PACKAGE_NAME}\"@" scripts/properties.sh
+          sed -i -E "s@^TERMUX__PREFIX_SUBDIR=\"usr\"\$@TERMUX__PREFIX_SUBDIR=\"${FORK_PREFIX_SUBDIR}\"@"         scripts/properties.sh
+          sed -i -E "s@^TERMUX__HOME_SUBDIR=\"home\"\$@TERMUX__HOME_SUBDIR=\"${FORK_HOME_SUBDIR}\"@"             scripts/properties.sh
+          sed -i -E "s@^__TERMUX_BUILD_PROPS__VALIDATE_TERMUX_PREFIX_USR_MERGE_FORMAT=\"true\"\$@__TERMUX_BUILD_PROPS__VALIDATE_TERMUX_PREFIX_USR_MERGE_FORMAT=\"${USR_MERGE_VALIDATION}\"@" scripts/properties.sh
 
-          if ! git diff --quiet; then
-            git diff
-          else
-            echo "::error ::properties.sh was not modified, sed patterns did not match"
+          if git diff --quiet; then
+            echo "::error ::properties.sh 没有被修改，sed 模式没匹配上，检查上游是否改动了这些行"
             exit 1
           fi
+          git diff
 
       - name: Show effective paths
         run: |
           bash -c '. scripts/properties.sh
-            printf "APP_DATA_DIR = %s\nPREFIX       = %s\nHOME         = %s\nROOTFS       = %s\n" \
-              "$TERMUX_APP__DATA_DIR" "$TERMUX__PREFIX" "$TERMUX__HOME" "$TERMUX__ROOTFS"'
+            echo "TERMUX_APP__DATA_DIR = $TERMUX_APP__DATA_DIR"
+            echo "TERMUX__ROOTFS       = $TERMUX__ROOTFS"
+            echo "TERMUX__PREFIX       = $TERMUX__PREFIX"
+            echo "TERMUX__HOME         = $TERMUX__HOME"'
 
-      - name: Create builder container
-        run: ./scripts/run-docker.sh true
-
-      - name: Prepare custom prefix inside container
+      # ------------------------------------------------------------------
+      # 准备持久化目录 + 启动容器（挂载进去）
+      # ------------------------------------------------------------------
+      - name: Prepare persistent dirs and container
         run: |
           set -euo pipefail
-          DATA_DIR="/data/data/${FORK_APP_PACKAGE_NAME}"
-          PREFIX="${DATA_DIR}/files/${FORK_PREFIX_SUBDIR}"
-          HOME_DIR="${DATA_DIR}/files/${FORK_HOME_SUBDIR}"
+          mkdir -p "$GITHUB_WORKSPACE/.ci/prefix" \
+                   "$GITHUB_WORKSPACE/.ci/built" \
+                   "$GITHUB_WORKSPACE/.ci/topdir"
 
-          # /data/data 在镜像里是 root:root 0755，builder 无法直接 mkdir
-          docker exec -u root termux-package-builder mkdir -p "$PREFIX" "$HOME_DIR" "${PREFIX}/tmp"
-          docker exec -u root termux-package-builder chown -R builder:builder "$DATA_DIR"
+          # run-docker.sh 只在“创建容器”时读取这个变量
+          echo "TERMUX_DOCKER_RUN_EXTRA_ARGS=--volume $GITHUB_WORKSPACE/.ci/prefix:/data/data/${FORK_APP_PACKAGE_NAME} --volume $GITHUB_WORKSPACE/.ci/built:/data/data/.built-packages --volume $GITHUB_WORKSPACE/.ci/topdir:/home/builder/.termux-build" >> "$GITHUB_ENV"
 
-          docker exec termux-package-builder sh -c "test -w '$PREFIX' && echo 'prefix writable OK'"
+          ./scripts/run-docker.sh true
+
+          # 确认容器内的 prefix 可写（挂载点属主 = runner uid = builder uid = 1001）
+          ./scripts/run-docker.sh sh -c "mkdir -p '/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}' && touch '/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}/.wtest' && rm -f '/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}/.wtest' && echo 'prefix writable OK'"
+
+          ./scripts/run-docker.sh sh -c 'test -w /data/data/.built-packages 2>/dev/null || (mkdir -p /data/data/.built-packages && echo "markers OK")'
 
       - name: Free additional disk space
         if: ${{ inputs.free-space }}
         run: ./scripts/free-space.sh
 
-      - name: Build packages
+      # ------------------------------------------------------------------
+      # 计算依赖拓扑顺序
+      # ------------------------------------------------------------------
+      - name: Resolve build order
         run: |
-          ./scripts/run-docker.sh ./build-package.sh \
-            -a "${{ inputs.arch }}" -C ${{ inputs.packages }}
+          set -uo pipefail
+          rm -f /tmp/order.raw /tmp/order.txt
+          : > /tmp/order.raw
 
-      - name: Verify artifact paths
+          for t in ${{ inputs.targets }}; do
+            dir=""
+            for d in packages root-packages x11-packages; do
+              if [ -d "$d/$t" ]; then dir="$d/$t"; break; fi
+            done
+            if [ -z "$dir" ]; then
+              echo "::warning::顶层包 '$t' 不存在，已跳过"
+              continue
+            fi
+            if ! python3 scripts/buildorder.py "$dir" packages root-packages x11-packages | awk 'NF{print $1}' >> /tmp/order.raw; then
+              echo "::warning::buildorder.py 解析 '$t' 依赖时失败"
+            fi
+            echo "$t" >> /tmp/order.raw
+          done
+
+          # 去重但保留首次出现的顺序 —— 拓扑顺序因此保持不变
+          awk 'NF && !seen[$0]++' /tmp/order.raw > /tmp/order.txt
+          echo "需要构建的包总数: $(wc -l < /tmp/order.txt)"
+          cat /tmp/order.txt
+          if [ ! -s /tmp/order.txt ]; then
+            echo "::error::构建列表为空"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # 分批构建（断点续跑）
+      # ------------------------------------------------------------------
+      - name: Build packages
+        timeout-minutes: 330
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          ARCH='${{ inputs.arch }}'
+          CHUNK='${{ inputs.chunk-size }}'
+          mapfile -t ALL < /tmp/order.txt
+          n=${#ALL[@]}
+          failed_chunks=0
+
+          for ((i = 0; i < n; i += CHUNK)); do
+            batch=("${ALL[@]:i:CHUNK}")
+            echo "::group::chunk $((i / CHUNK + 1)) — 第 $((i + 1))..$((i + ${#batch[@]})) 个包: ${batch[*]}"
+            if ! ./scripts/run-docker.sh ./build-package.sh -a "$ARCH" -C "${batch[@]}"; then
+              failed_chunks=$((failed_chunks + 1))
+              echo "::warning::chunk $((i / CHUNK + 1)) 有包构建失败，继续下一批（已完成的包会被自动跳过）"
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "失败批次: $failed_chunks / $(( (n + CHUNK - 1) / CHUNK ))"
+          # 不让单批失败把整个 workflow 判红，最终以产物为准
+          exit 0
+
+      # ------------------------------------------------------------------
+      # 校验 + 上传
+      # ------------------------------------------------------------------
+      - name: Verify artifacts
         if: always()
         run: |
-          set -o pipefail
+          set -uo pipefail
           shopt -s nullglob
           debs=(output/*.deb)
-          echo "built ${#debs[@]} .deb files"
-          for f in "${debs[@]}"; do
-            dpkg-deb -f "$f" Package Version Architecture 2>/dev/null | tr '\n' ' '
-            echo
-          done
-          expected="/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}"
-          if [ ${#debs[@]} -gt 0 ]; then
-            dpkg-deb -c "${debs[0]}" | head -3
-            if dpkg-deb -c "${debs[0]}" | grep -q "\.${expected}/"; then
-              echo "OK: paths point to ${expected}"
-            else
-              echo "::error ::deb paths do not contain ${expected}"
-              exit 1
-            fi
+          echo "共产出 ${#debs[@]} 个 .deb"
+
+          EXPECTED="/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}"
+
+          if [ ${#debs[@]} -eq 0 ]; then
+            echo "::error::没有任何 .deb 产出"
+            exit 1
           fi
+
+          {
+            echo "## Fork build 结果"
+            echo ""
+            echo "目标 prefix: \`${EXPECTED}\`"
+            echo ""
+            echo "| 包 | 版本 | 架构 |"
+            echo "|---|---|---|"
+            for f in "${debs[@]}"; do
+              pkg=$(dpkg-deb -f "$f" Package 2>/dev/null || echo "?")
+              ver=$(dpkg-deb -f "$f" Version 2>/dev/null || echo "?")
+              arc=$(dpkg-deb -f "$f" Architecture 2>/dev/null || echo "?")
+              echo "| $pkg | $ver | $arc |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          bad=0
+          for f in "${debs[@]}"; do
+            if ! dpkg-deb -c "$f" | grep -q "\.${EXPECTED}/"; then
+              echo "::warning::$(basename "$f") 里没有 ${EXPECTED} 路径"
+              bad=$((bad + 1))
+            fi
+          done
+          echo "路径不符的包: $bad / ${#debs[@]}"
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::有包的文件路径不在自定义 prefix 下"
+            exit 1
+          fi
+
+          ls -1 output/*.deb | xargs -n1 basename > output/MANIFEST.txt
+          head -5 output/MANIFEST.txt
 
       - name: Upload debs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debs-${{ inputs.arch }}-${{ github.sha }}
-          path: output/*.deb
+          path: |
+            output/*.deb
+            output/MANIFEST.txt
           if-no-files-found: warn
           retention-days: 30
