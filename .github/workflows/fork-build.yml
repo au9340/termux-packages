@@ -4,7 +4,7 @@ name: Fork build
 # 相对官方只有三处差异，其余（runner、docker 调用、产物打包、artifact 命名）完全一致：
 #   1. 构建前把 TERMUX_APP__PACKAGE_NAME 换成 bin.mt.plus
 #   2. 容器里 /data/data 是 root:root，需先用 root 建出自定义 prefix 目录
-#   3. 顶层包逐个调用，且编译输出写入文件、只在失败时回显关键行
+#   3. 顶层包逐个调用，编译输出写入文件，失败时回显开头+错误行+结尾
 #
 # 触发：push 到 master 且 commit message 带 [build]，或手动 Run workflow。
 
@@ -44,6 +44,8 @@ env:
   FORK_APP_PACKAGE_NAME: bin.mt.plus
   FORK_PREFIX_SUBDIR: usr
   FORK_HOME_SUBDIR: home
+  # 匹配“系统性失败”和“编译失败”两类关键字
+  ERR_PATTERN: 'ERROR|error:|Error [0-9]|No files in package|undefined reference|Permission denied|cannot create|No such file|No space left|fatal error|not found|termux - building'
 
 jobs:
   build:
@@ -70,13 +72,12 @@ jobs:
             "/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_HOME_SUBDIR}"
         docker exec -u root termux-package-builder chown -R builder:builder \
             "/data/data/${FORK_APP_PACKAGE_NAME}"
+        docker exec termux-package-builder sh -c "touch '/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}/.w' && rm -f '/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}/.w' && echo prefix-writable-OK"
 
     - name: Free additional disk space
       if: ${{ github.event_name != 'workflow_dispatch' || inputs.free-space }}
       run: ./scripts/free-space.sh
 
-    # 编译输出写入 /tmp/build-logs/<pkg>.log，不打进 Actions 日志。
-    # 失败时只回显关键错误行 + 末尾 20 行，并把摘要写进 artifacts/errors.txt
     - name: Build packages
       run: |
         set -uo pipefail
@@ -98,24 +99,36 @@ jobs:
             echo "✅ OK: $pkg  ($(wc -l < "$log") 行日志，已存档)"
           else
             failed="$failed $pkg"
-            echo "::error title=构建失败: $pkg (exit $rc)::看下面回显的错误行即可，完整日志见 artifact 里的 errors.txt"
-            echo "--- 关键错误行 ---"
-            grep -nE 'ERROR|No files in package|error:|Error [0-9]|undefined reference|cannot find|No such file|fatal error' "$log" | tail -30 || true
-            echo "--- 末尾 20 行 ---"
-            tail -20 "$log"
+            echo "::error title=构建失败: $pkg (exit $rc)::完整错误见 artifact 里的 errors.txt"
+            echo "--- 日志开头 30 行（系统性错误通常在这里，如权限/路径/工具缺失）---"
+            head -30 "$log" || true
+            echo "--- 关键行 ---"
+            grep -nE "$ERR_PATTERN" "$log" | tail -25 || true
+            echo "--- 日志末尾 25 行（编译错误通常在这里）---"
+            tail -25 "$log" || true
             {
               echo "############################################################"
-              echo "# 包: $pkg   exit=$rc   日志行数: $(wc -l < "$log")"
+              echo "# 包: $pkg   exit=$rc   总行数: $(wc -l < "$log")"
               echo "############################################################"
-              echo "--- 关键错误行 ---"
-              grep -nE 'ERROR|No files in package|error:|Error [0-9]|undefined reference|cannot find|No such file|fatal error' "$log" | tail -40 || true
+              echo "--- 开头 30 行 ---"
+              head -30 "$log" || true
+              echo
+              echo "--- 关键行 ---"
+              grep -nE "$ERR_PATTERN" "$log" | tail -40 || true
               echo
               echo "--- 末尾 60 行 ---"
-              tail -60 "$log"
+              tail -60 "$log" || true
               echo
             } >> artifacts/errors.txt
           fi
           echo "::endgroup::"
+
+          # 第一个包就失败且一个 deb 都没有 -> 基本是系统性问题，没必要再试 32 次
+          if [ $rc -ne 0 ] && [ "$(ls output/*.deb 2>/dev/null | wc -l)" -eq 0 ] && [ "$ok_count" -eq 0 ]; then
+            echo "::error title=疑似系统性问题::第一个包就失败且没有任何 deb 产出，终止后续构建。请看上面开头 30 行与 artifact 里的 errors.txt"
+            echo "!!! 第一个包 $pkg 就失败且零 deb 产出，终止 !!!" >> artifacts/errors.txt
+            break
+          fi
         done
 
         total=$(echo $PKGS | wc -w)
@@ -134,7 +147,6 @@ jobs:
         } >> "$GITHUB_STEP_SUMMARY"
         [ -z "$failed" ]
 
-    # 与官方一致：deb 文件名里可能含 ':'（epoch），不能直接上传，须先打 tar
     - name: Generate build artifacts
       if: always()
       run: |
@@ -150,7 +162,7 @@ jobs:
           echo "--- 路径抽查 ---"
           dpkg-deb -c "${debs[0]}" | head -3
         else
-          echo "::error::output/ 里没有 .deb"
+          echo "::error::output/ 里没有 .deb（见 artifacts/errors.txt）"
         fi
         tar cf "artifacts/debs-${ARCH}-${GITHUB_SHA}.tar" debs
         ls -lh artifacts/
