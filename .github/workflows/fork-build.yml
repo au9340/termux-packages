@@ -1,6 +1,8 @@
 name: Fork build
 
-# 一键构建：Actions -> Fork build -> Run workflow -> 保持默认参数 -> Run
+# 触发方式：
+#   1. push 到 master，且 commit message 里带 [build]  -> 自动开跑（无需点按钮）
+#   2. Actions 页面手动 Run workflow（手机端需切“桌面版网站”才看得到按钮）
 #
 # 设计要点：
 # 1. 不改仓库里的 scripts/properties.sh，构建前用 sed 注入，方便随时 git pull upstream。
@@ -13,6 +15,9 @@ name: Fork build
 # 5. artifact 用 if: always() 上传，中途失败也能拿到已经编好的 .deb。
 
 on:
+  push:
+    branches:
+      - master
   workflow_dispatch:
     inputs:
       arch:
@@ -34,15 +39,11 @@ on:
         description: "每批构建的包数（小一点=断点更细，失败损失更小）"
         required: true
         default: "8"
-      free-space:
-        description: "构建前清理 runner 磁盘空间"
-        type: boolean
-        default: true
 
 permissions:
   contents: read
 
-# 同一时间只允许一个构建，避免两个 run 抢同一个 cwd 下的缓存
+# 同一时间只允许一个构建，避免两个 run 抢同一个 workspace 下的缓存
 concurrency:
   group: fork-build
   cancel-in-progress: false
@@ -56,8 +57,15 @@ env:
   FORK_HOME_SUBDIR: home
   USR_MERGE_VALIDATION: "true"
 
+  # 手动触发时用输入值，push 触发时用默认值
+  BUILD_ARCH: ${{ inputs.arch || 'aarch64' }}
+  BUILD_TARGETS: ${{ inputs.targets || 'apt bash bzip2 command-not-found coreutils curl dash diffutils findutils gawk grep gzip less procps psmisc sed tar termux-core termux-exec termux-keyring termux-tools util-linux xz-utils ed debianutils dos2unix inetutils lsof nano net-tools patch unzip' }}
+  BUILD_CHUNK_SIZE: ${{ inputs.chunk-size || '8' }}
+
 jobs:
   build:
+    # push 触发时只有 commit message 带 [build] 才真正构建，避免日常提交消耗 3 小时
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message || '', '[build]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     steps:
@@ -65,6 +73,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      - name: Show build parameters
+        run: |
+          echo "触发方式     : ${{ github.event_name }}"
+          echo "架构         : $BUILD_ARCH"
+          echo "分批大小     : $BUILD_CHUNK_SIZE"
+          echo "顶层包       : $BUILD_TARGETS"
 
       # ------------------------------------------------------------------
       # 恢复上一次的构建状态，让重跑几乎不用重新编译
@@ -76,9 +91,9 @@ jobs:
             .ci/prefix
             .ci/built
             .ci/topdir/_cache
-          key: fork-build-${{ inputs.arch }}-${{ github.sha }}
+          key: fork-build-${{ env.BUILD_ARCH }}-${{ github.sha }}
           restore-keys: |
-            fork-build-${{ inputs.arch }}-
+            fork-build-${{ env.BUILD_ARCH }}-
 
       # ------------------------------------------------------------------
       # 注入自定义 prefix
@@ -120,13 +135,11 @@ jobs:
 
           ./scripts/run-docker.sh true
 
-          # 确认容器内的 prefix 可写（挂载点属主 = runner uid = builder uid = 1001）
           ./scripts/run-docker.sh sh -c "mkdir -p '/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}' && touch '/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}/.wtest' && rm -f '/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}/.wtest' && echo 'prefix writable OK'"
 
           ./scripts/run-docker.sh sh -c 'test -w /data/data/.built-packages 2>/dev/null || (mkdir -p /data/data/.built-packages && echo "markers OK")'
 
       - name: Free additional disk space
-        if: ${{ inputs.free-space }}
         run: ./scripts/free-space.sh
 
       # ------------------------------------------------------------------
@@ -138,7 +151,7 @@ jobs:
           rm -f /tmp/order.raw /tmp/order.txt
           : > /tmp/order.raw
 
-          for t in ${{ inputs.targets }}; do
+          for t in $BUILD_TARGETS; do
             dir=""
             for d in packages root-packages x11-packages; do
               if [ -d "$d/$t" ]; then dir="$d/$t"; break; fi
@@ -170,8 +183,8 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
-          ARCH='${{ inputs.arch }}'
-          CHUNK='${{ inputs.chunk-size }}'
+          ARCH="$BUILD_ARCH"
+          CHUNK="$BUILD_CHUNK_SIZE"
           mapfile -t ALL < /tmp/order.txt
           n=${#ALL[@]}
           failed_chunks=0
@@ -243,7 +256,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debs-${{ inputs.arch }}-${{ github.sha }}
+          name: debs-${{ env.BUILD_ARCH }}-${{ github.sha }}
           path: |
             output/*.deb
             output/MANIFEST.txt
