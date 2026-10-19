@@ -6,10 +6,10 @@ name: Fork build
 #
 # 设计要点：
 # 1. 不改仓库里的 scripts/properties.sh，构建前用 sed 注入，方便随时 git pull upstream。
-# 2. 用 scripts/buildorder.py 自动算出依赖拓扑顺序，而不是手写包名列表。
+# 2. 用 scripts/buildorder.py 自动算出依赖拓扑顺序（必须在 free-space.sh 之前跑，
+#    因为那个脚本会把宿主机的 python3 卸掉）。
 # 3. 分批调用 build-package.sh。Termux 用 /data/data/.built-packages 里的标记文件
-#    判断“这个包已经编过”，因此某批失败/超时后，下一批会自动跳过已完成的包继续往前，
-#    不会重头再来。
+#    判断“这个包已经编过”，因此某批失败/超时后，下一批会自动跳过已完成的包继续往前。
 # 4. prefix、标记目录、$TERMUX_TOPDIR 都 bind-mount 到 workspace 里并做缓存，
 #    所以重跑一次 workflow 几乎不用重新编译。
 # 5. artifact 用 if: always() 上传，中途失败也能拿到已经编好的 .deb。
@@ -43,7 +43,6 @@ on:
 permissions:
   contents: read
 
-# 同一时间只允许一个构建，避免两个 run 抢同一个 workspace 下的缓存
 concurrency:
   group: fork-build
   cancel-in-progress: false
@@ -64,7 +63,7 @@ env:
 
 jobs:
   build:
-    # push 触发时只有 commit message 带 [build] 才真正构建，避免日常提交消耗 3 小时
+    # push 触发时只有 commit message 带 [build] 才真正构建
     if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message || '', '[build]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 355
@@ -121,29 +120,7 @@ jobs:
             echo "TERMUX__HOME         = $TERMUX__HOME"'
 
       # ------------------------------------------------------------------
-      # 准备持久化目录 + 启动容器（挂载进去）
-      # ------------------------------------------------------------------
-      - name: Prepare persistent dirs and container
-        run: |
-          set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/.ci/prefix" \
-                   "$GITHUB_WORKSPACE/.ci/built" \
-                   "$GITHUB_WORKSPACE/.ci/topdir"
-
-          # run-docker.sh 只在“创建容器”时读取这个变量
-          echo "TERMUX_DOCKER_RUN_EXTRA_ARGS=--volume $GITHUB_WORKSPACE/.ci/prefix:/data/data/${FORK_APP_PACKAGE_NAME} --volume $GITHUB_WORKSPACE/.ci/built:/data/data/.built-packages --volume $GITHUB_WORKSPACE/.ci/topdir:/home/builder/.termux-build" >> "$GITHUB_ENV"
-
-          ./scripts/run-docker.sh true
-
-          ./scripts/run-docker.sh sh -c "mkdir -p '/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}' && touch '/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}/.wtest' && rm -f '/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}/.wtest' && echo 'prefix writable OK'"
-
-          ./scripts/run-docker.sh sh -c 'test -w /data/data/.built-packages 2>/dev/null || (mkdir -p /data/data/.built-packages && echo "markers OK")'
-
-      - name: Free additional disk space
-        run: ./scripts/free-space.sh
-
-      # ------------------------------------------------------------------
-      # 计算依赖拓扑顺序
+      # 必须在 free-space.sh 之前！它会把宿主机的 python3 卸掉
       # ------------------------------------------------------------------
       - name: Resolve build order
         run: |
@@ -166,7 +143,6 @@ jobs:
             echo "$t" >> /tmp/order.raw
           done
 
-          # 去重但保留首次出现的顺序 —— 拓扑顺序因此保持不变
           awk 'NF && !seen[$0]++' /tmp/order.raw > /tmp/order.txt
           echo "需要构建的包总数: $(wc -l < /tmp/order.txt)"
           cat /tmp/order.txt
@@ -174,6 +150,44 @@ jobs:
             echo "::error::构建列表为空"
             exit 1
           fi
+
+      # ------------------------------------------------------------------
+      # 启动容器。注意：TERMUX_DOCKER_RUN_EXTRA_ARGS 必须在**同一个 shell**
+      # 里 export，写进 $GITHUB_ENV 对当前步骤是无效的（只对后续步骤生效）。
+      # ------------------------------------------------------------------
+      - name: Prepare persistent dirs and container
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.ci/prefix" \
+                   "$GITHUB_WORKSPACE/.ci/built" \
+                   "$GITHUB_WORKSPACE/.ci/topdir"
+
+          export TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume $GITHUB_WORKSPACE/.ci/prefix:/data/data/${FORK_APP_PACKAGE_NAME} --volume $GITHUB_WORKSPACE/.ci/built:/data/data/.built-packages --volume $GITHUB_WORKSPACE/.ci/topdir:/home/builder/.termux-build"
+          echo "EXTRA_ARGS = $TERMUX_DOCKER_RUN_EXTRA_ARGS"
+
+          # 如果上一次跑残留了容器（没有挂载），先删掉重建
+          docker rm -f termux-package-builder >/dev/null 2>&1 || true
+
+          ./scripts/run-docker.sh true
+
+          echo "--- 容器内挂载点 ---"
+          docker exec termux-package-builder sh -c 'mount | grep -E "termux-packages|/data/data|termux-build" || true'
+          docker exec termux-package-builder id
+
+          PREFIX_DIR="/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}"
+          # 用 root 建目录并交还属主：即使 bind mount 没生效也能正常构建
+          docker exec -u root termux-package-builder mkdir -p \
+              "/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_PREFIX_SUBDIR}" \
+              "/data/data/${FORK_APP_PACKAGE_NAME}/files/${FORK_HOME_SUBDIR}" \
+              "/data/data/.built-packages"
+          docker exec -u root termux-package-builder chown -R builder:builder \
+              "/data/data/${FORK_APP_PACKAGE_NAME}" "/data/data/.built-packages"
+
+          docker exec termux-package-builder sh -c "touch '${PREFIX_DIR}/.wtest' && rm -f '${PREFIX_DIR}/.wtest' && echo 'prefix writable OK'"
+
+      - name: Free additional disk space
+        continue-on-error: true
+        run: ./scripts/free-space.sh
 
       # ------------------------------------------------------------------
       # 分批构建（断点续跑）
@@ -200,8 +214,35 @@ jobs:
           done
 
           echo "失败批次: $failed_chunks / $(( (n + CHUNK - 1) / CHUNK ))"
-          # 不让单批失败把整个 workflow 判红，最终以产物为准
           exit 0
+
+      # ------------------------------------------------------------------
+      # 失败时自动 dump 诊断信息
+      # ------------------------------------------------------------------
+      - name: Diagnostics
+        if: failure()
+        run: |
+          set +e
+          echo "=== docker ps ==="
+          docker ps -a
+          echo "=== runner identity ==="
+          id
+          echo "=== container identity ==="
+          docker exec termux-package-builder id
+          echo "=== container mounts ==="
+          docker exec termux-package-builder mount
+          echo "=== /data permissions ==="
+          docker exec termux-package-builder ls -ld /data /data/data /data/data/* 2>&1
+          echo "=== persistent dirs ==="
+          ls -la "$GITHUB_WORKSPACE/.ci" || true
+          echo "=== output dir ==="
+          ls -la output 2>&1 || true
+          echo "=== build order file ==="
+          cat /tmp/order.txt 2>&1 || true
+          echo "=== host toolchain ==="
+          for c in python3 jq dpkg-deb docker curl git; do
+            printf '%-10s %s\n' "$c" "$(command -v "$c" || echo MISSING)"
+          done
 
       # ------------------------------------------------------------------
       # 校验 + 上传
