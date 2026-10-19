@@ -44,8 +44,7 @@ env:
   FORK_APP_PACKAGE_NAME: bin.mt.plus
   FORK_PREFIX_SUBDIR: usr
   FORK_HOME_SUBDIR: home
-  # 匹配“系统性失败”和“编译失败”两类关键字
-  ERR_PATTERN: 'ERROR|error:|Error [0-9]|No files in package|undefined reference|Permission denied|cannot create|No such file|No space left|fatal error|not found|termux - building'
+  ERR_PATTERN: 'ERROR|error:|Error [0-9]|No files in package|undefined reference|Permission denied|cannot create|No such file|No space left|fatal error'
 
 jobs:
   build:
@@ -78,8 +77,11 @@ jobs:
       if: ${{ github.event_name != 'workflow_dispatch' || inputs.free-space }}
       run: ./scripts/free-space.sh
 
+    # ⚠️ GitHub 的默认 shell 是 `bash -eo pipefail`，`-e` 会让第一个失败的命令
+    # 直接终止整个脚本，导致下面的 rc=$? / 错误处理全部失效。必须先 set +e。
     - name: Build packages
       run: |
+        set +e
         set -uo pipefail
         ARCH='${{ inputs.arch || 'aarch64' }}'
         PKGS='${{ inputs.packages || 'apt bash bzip2 command-not-found coreutils curl dash diffutils findutils gawk grep gzip less procps psmisc sed tar termux-core termux-exec termux-keyring termux-tools util-linux xz-utils ed debianutils dos2unix inetutils lsof nano net-tools patch unzip' }}'
@@ -88,6 +90,7 @@ jobs:
         : > artifacts/errors.txt
         failed=""
         ok_count=0
+        first_pkg=""
 
         for pkg in $PKGS; do
           log="$LOGDIR/$pkg.log"
@@ -96,56 +99,50 @@ jobs:
           rc=$?
           if [ $rc -eq 0 ]; then
             ok_count=$((ok_count + 1))
-            echo "✅ OK: $pkg  ($(wc -l < "$log") 行日志，已存档)"
+            echo "✅ OK: $pkg  ($(wc -l < "$log") 行日志已存档)"
           else
             failed="$failed $pkg"
             echo "::error title=构建失败: $pkg (exit $rc)::完整错误见 artifact 里的 errors.txt"
-            echo "--- 日志开头 30 行（系统性错误通常在这里，如权限/路径/工具缺失）---"
-            head -30 "$log" || true
+            echo "--- 日志开头 30 行（系统性错误通常在这里）---"
+            head -30 "$log"
             echo "--- 关键行 ---"
-            grep -nE "$ERR_PATTERN" "$log" | tail -25 || true
+            grep -nE "$ERR_PATTERN" "$log" | tail -25
             echo "--- 日志末尾 25 行（编译错误通常在这里）---"
-            tail -25 "$log" || true
+            tail -25 "$log"
             {
-              echo "############################################################"
-              echo "# 包: $pkg   exit=$rc   总行数: $(wc -l < "$log")"
-              echo "############################################################"
-              echo "--- 开头 30 行 ---"
-              head -30 "$log" || true
-              echo
-              echo "--- 关键行 ---"
-              grep -nE "$ERR_PATTERN" "$log" | tail -40 || true
-              echo
-              echo "--- 末尾 60 行 ---"
-              tail -60 "$log" || true
+              echo "############ 包: $pkg   exit=$rc   总行数: $(wc -l < "$log") ############"
+              echo "--- 开头 30 行 ---"; head -30 "$log"
+              echo; echo "--- 关键行 ---"; grep -nE "$ERR_PATTERN" "$log" | tail -40
+              echo; echo "--- 末尾 60 行 ---"; tail -60 "$log"
               echo
             } >> artifacts/errors.txt
+
+            # 第一个包就失败且零 deb -> 系统性问题，没必要再试剩下的
+            if [ "$ok_count" -eq 0 ] && [ "$(ls output/*.deb 2>/dev/null | wc -l)" -eq 0 ]; then
+              echo "::error title=疑似系统性问题::第一个包就失败且零 deb 产出，终止后续构建"
+              echo "!!! 第一个包 $pkg 就失败且零 deb，终止 !!!" >> artifacts/errors.txt
+              break
+            fi
           fi
           echo "::endgroup::"
-
-          # 第一个包就失败且一个 deb 都没有 -> 基本是系统性问题，没必要再试 32 次
-          if [ $rc -ne 0 ] && [ "$(ls output/*.deb 2>/dev/null | wc -l)" -eq 0 ] && [ "$ok_count" -eq 0 ]; then
-            echo "::error title=疑似系统性问题::第一个包就失败且没有任何 deb 产出，终止后续构建。请看上面开头 30 行与 artifact 里的 errors.txt"
-            echo "!!! 第一个包 $pkg 就失败且零 deb 产出，终止 !!!" >> artifacts/errors.txt
-            break
-          fi
         done
 
         total=$(echo $PKGS | wc -w)
+        built=$(ls output/*.deb 2>/dev/null | wc -l)
         echo ""
         echo "=============================================="
-        echo "成功: $ok_count / $total"
+        echo "成功: $ok_count / $total    产出 deb: $built 个"
         echo "失败:${failed:- 无}"
-        echo "已产出 deb: $(ls output/*.deb 2>/dev/null | wc -l) 个"
         echo "=============================================="
         {
           echo "### 构建结果"
           echo ""
           echo "- 成功: **$ok_count / $total**"
           echo "- 失败:\`${failed:- 无}\`"
-          echo "- 产出 deb: $(ls output/*.deb 2>/dev/null | wc -l) 个"
+          echo "- 产出 deb: **$built** 个"
         } >> "$GITHUB_STEP_SUMMARY"
-        [ -z "$failed" ]
+        if [ -n "$failed" ]; then exit 1; fi
+        exit 0
 
     - name: Generate build artifacts
       if: always()
