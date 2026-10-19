@@ -4,8 +4,7 @@ name: Fork build
 # 相对官方只有三处差异，其余（runner、docker 调用、产物打包、artifact 命名）完全一致：
 #   1. 构建前把 TERMUX_APP__PACKAGE_NAME 换成 bin.mt.plus
 #   2. 容器里 /data/data 是 root:root，需先用 root 建出自定义 prefix 目录
-#   3. 顶层包逐个调用（官方一次只传本次改动的几个包，我们一次传 33 个，
-#      若一次全传，单个失败会让后面的全部不编）
+#   3. 顶层包逐个调用，且编译输出写入文件、只在失败时回显关键行
 #
 # 触发：push 到 master 且 commit message 带 [build]，或手动 Run workflow。
 
@@ -76,29 +75,61 @@ jobs:
       if: ${{ github.event_name != 'workflow_dispatch' || inputs.free-space }}
       run: ./scripts/free-space.sh
 
+    # 编译输出写入 /tmp/build-logs/<pkg>.log，不打进 Actions 日志。
+    # 失败时只回显关键错误行 + 末尾 20 行，并把摘要写进 artifacts/errors.txt
     - name: Build packages
       run: |
+        set -uo pipefail
         ARCH='${{ inputs.arch || 'aarch64' }}'
         PKGS='${{ inputs.packages || 'apt bash bzip2 command-not-found coreutils curl dash diffutils findutils gawk grep gzip less procps psmisc sed tar termux-core termux-exec termux-keyring termux-tools util-linux xz-utils ed debianutils dos2unix inetutils lsof nano net-tools patch unzip' }}'
+        LOGDIR=/tmp/build-logs
+        mkdir -p "$LOGDIR" artifacts
+        : > artifacts/errors.txt
         failed=""
+        ok_count=0
+
         for pkg in $PKGS; do
+          log="$LOGDIR/$pkg.log"
           echo "::group::build $pkg"
-          if ./scripts/run-docker.sh -d ./build-package.sh -I -C -a "$ARCH" "$pkg"; then
-            echo "OK: $pkg"
+          ./scripts/run-docker.sh -d ./build-package.sh -I -C -a "$ARCH" "$pkg" >"$log" 2>&1
+          rc=$?
+          if [ $rc -eq 0 ]; then
+            ok_count=$((ok_count + 1))
+            echo "✅ OK: $pkg  ($(wc -l < "$log") 行日志，已存档)"
           else
-            echo "::error title=构建失败::$pkg"
             failed="$failed $pkg"
+            echo "::error title=构建失败: $pkg (exit $rc)::看下面回显的错误行即可，完整日志见 artifact 里的 errors.txt"
+            echo "--- 关键错误行 ---"
+            grep -nE 'ERROR|No files in package|error:|Error [0-9]|undefined reference|cannot find|No such file|fatal error' "$log" | tail -30 || true
+            echo "--- 末尾 20 行 ---"
+            tail -20 "$log"
+            {
+              echo "############################################################"
+              echo "# 包: $pkg   exit=$rc   日志行数: $(wc -l < "$log")"
+              echo "############################################################"
+              echo "--- 关键错误行 ---"
+              grep -nE 'ERROR|No files in package|error:|Error [0-9]|undefined reference|cannot find|No such file|fatal error' "$log" | tail -40 || true
+              echo
+              echo "--- 末尾 60 行 ---"
+              tail -60 "$log"
+              echo
+            } >> artifacts/errors.txt
           fi
           echo "::endgroup::"
         done
+
+        total=$(echo $PKGS | wc -w)
+        echo ""
         echo "=============================================="
-        echo "失败的顶层包:${failed:- 无}"
+        echo "成功: $ok_count / $total"
+        echo "失败:${failed:- 无}"
         echo "已产出 deb: $(ls output/*.deb 2>/dev/null | wc -l) 个"
         echo "=============================================="
         {
           echo "### 构建结果"
           echo ""
-          echo "- 失败:${failed:- 无}"
+          echo "- 成功: **$ok_count / $total**"
+          echo "- 失败:\`${failed:- 无}\`"
           echo "- 产出 deb: $(ls output/*.deb 2>/dev/null | wc -l) 个"
         } >> "$GITHUB_STEP_SUMMARY"
         [ -z "$failed" ]
@@ -107,6 +138,7 @@ jobs:
     - name: Generate build artifacts
       if: always()
       run: |
+        set -u
         ARCH='${{ inputs.arch || 'aarch64' }}'
         mkdir -p artifacts debs
         shopt -s nullglob
@@ -114,7 +146,6 @@ jobs:
         echo "共产出 ${#debs[@]} 个 .deb"
         if [ ${#debs[@]} -gt 0 ]; then
           cp "${debs[@]}" debs/
-          echo "--- 前 5 个 ---"
           ls -1 debs/*.deb | head -5
           echo "--- 路径抽查 ---"
           dpkg-deb -c "${debs[0]}" | head -3
